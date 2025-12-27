@@ -11,19 +11,16 @@
         import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // ========================================================
-        // 1. 環境設定の取得 (Canvas内か外部公開用かを自動判定)
+        // 1. 環境設定の取得
         // ========================================================
         let firebaseConfig;
         let initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
         const currentAppId = typeof __app_id !== 'undefined' ? __app_id : 'my-personal-dashboard';
 
         if (typeof __firebase_config !== 'undefined') {
-            // Canvas環境（このプレビュー画面）での実行時
             firebaseConfig = JSON.parse(__firebase_config);
         } else {
-            // ====================================================
-            // 【重要】GitHub Pages等で公開する場合は、ここを自分の設定に書き換えてね！
-            // ====================================================
+            // 公開用設定（Firebaseを使う場合はここに自分の値を入力）
             firebaseConfig = {
                 apiKey: "YOUR_API_KEY",
                 authDomain: "YOUR_PROJECT_ID.firebaseapp.com",
@@ -34,21 +31,15 @@
             };
         }
 
-        // --- Firebase 初期化 ---
         const app = initializeApp(firebaseConfig);
         const auth = getAuth(app);
         const db = getFirestore(app);
         
-        // --- 認証処理 (RULE 3 準拠) ---
         const initAuth = async () => {
             try {
                 if (initialAuthToken) {
                     await signInWithCustomToken(auth, initialAuthToken);
-                } else {
-                    if (firebaseConfig.apiKey === "YOUR_API_KEY") {
-                        console.warn("Firebase API Key is still default. Please update your config.");
-                        return;
-                    }
+                } else if (firebaseConfig.apiKey !== "YOUR_API_KEY") {
                     await signInAnonymously(auth);
                 }
             } catch (error) {
@@ -57,36 +48,28 @@
         };
         initAuth();
 
-        // 認証状態の監視
         onAuthStateChanged(auth, async (user) => {
-            if (user) {
-                window.currentUser = user;
-                setupMemoListener();
+            setupMemoListener();
+            fetchNews();
+            fetchWeather();
+            fetchMusicCharts();
+            
+            setInterval(() => {
                 fetchNews();
-                fetchWeather();
                 fetchMusicCharts();
-                
-                setInterval(() => {
-                    fetchNews();
-                    fetchMusicCharts();
-                }, 600000);
-            }
+                fetchWeather();
+            }, 600000);
         });
 
-        // --- メモ同期 (RULE 1 準拠) ---
         function setupMemoListener() {
             if (!auth.currentUser) return;
-            
             const memoRef = doc(db, 'artifacts', currentAppId, 'users', auth.currentUser.uid, 'settings', 'memo');
             const memoArea = document.getElementById('memo-area');
-            
             onSnapshot(memoRef, (docSnap) => {
                 if (docSnap.exists() && document.activeElement !== memoArea) {
                     memoArea.value = docSnap.data().text || '';
                 }
-            }, (error) => {
-                console.error("Firestore Error:", error);
-            });
+            }, (error) => console.error("Firestore Error:", error));
 
             let timeout;
             memoArea.addEventListener('input', () => {
@@ -96,37 +79,40 @@
                         try {
                             const ref = doc(db, 'artifacts', currentAppId, 'users', auth.currentUser.uid, 'settings', 'memo');
                             await setDoc(ref, { text: memoArea.value }, { merge: true });
-                        } catch (e) {
-                            console.error("Save failed:", e);
-                        }
+                        } catch (e) { console.error("Save failed:", e); }
                     }
                 }, 1000);
             });
         }
 
-        // --- データ取得関数群 ---
+        // --- 公開環境でも動きやすいようにプロキシを強化 ---
         window.fetchMusicCharts = async () => {
             const chartContainer = document.getElementById('music-chart-list');
             const appleUrl = 'https://rss.applemarketingtools.com/api/v2/jp/music/most-played/10/songs.json';
-            const proxies = [
-                (url) => `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
-                (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`
+            
+            // 複数のプロキシを順に試す仕組み
+            const proxyUrls = [
+                `https://api.allorigins.win/get?url=${encodeURIComponent(appleUrl)}`,
+                `https://corsproxy.io/?${encodeURIComponent(appleUrl)}`,
+                `https://thingproxy.freeboard.io/fetch/${appleUrl}`
             ];
 
-            for (const getProxyUrl of proxies) {
+            for (const url of proxyUrls) {
                 try {
-                    const response = await fetch(getProxyUrl(appleUrl));
+                    const response = await fetch(url);
                     if (!response.ok) continue;
-                    let jsonData;
-                    if (getProxyUrl.toString().includes('allorigins')) {
-                        const raw = await response.json();
-                        jsonData = JSON.parse(raw.contents);
+                    
+                    let data;
+                    if (url.includes('allorigins')) {
+                        const json = await response.json();
+                        data = JSON.parse(json.contents);
                     } else {
-                        jsonData = await response.json();
+                        data = await response.json();
                     }
-                    if (jsonData.feed && jsonData.feed.results) {
+
+                    if (data && data.feed && data.feed.results) {
                         chartContainer.innerHTML = '';
-                        jsonData.feed.results.forEach((song, index) => {
+                        data.feed.results.forEach((song, index) => {
                             const row = document.createElement('div');
                             row.className = "flex items-center gap-3 p-2 hover:bg-white/5 rounded-xl transition group";
                             row.innerHTML = `
@@ -139,49 +125,69 @@
                             `;
                             chartContainer.appendChild(row);
                         });
-                        return;
+                        return; // 成功したら終了
                     }
-                } catch (error) { console.warn("Proxy failed", error); }
+                } catch (e) { console.warn("Music fetch failed with one proxy, trying next..."); }
             }
-            chartContainer.innerHTML = `<div class="text-xs text-red-400 p-4">取得に失敗しました</div>`;
+            chartContainer.innerHTML = `<div class="text-xs text-slate-500 p-4 italic text-center">音楽データを読み込めませんでした</div>`;
         };
 
         window.fetchNews = async () => {
             const newsContainer = document.getElementById('news-list');
             const refreshBtn = document.getElementById('news-refresh-icon');
             if (refreshBtn) refreshBtn.classList.add('animate-spin');
-            try {
-                const rssUrl = encodeURIComponent('https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja');
-                const endpoint = `https://api.rss2json.com/v1/api.json?rss_url=${rssUrl}`;
-                const response = await fetch(endpoint);
-                const data = await response.json();
-                if (data.status === 'ok') {
-                    newsContainer.innerHTML = '';
-                    data.items.slice(0, 10).forEach(item => {
-                        const card = document.createElement('a');
-                        card.href = item.link; card.target = "_blank";
-                        card.className = "block news-card p-5 border border-transparent hover:border-white/10";
-                        const date = new Date(item.pubDate).toLocaleTimeString('ja-JP', {hour: '2-digit', minute:'2-digit'});
-                        card.innerHTML = `
-                            <span class="text-xs font-bold uppercase tracking-wider text-blue-400">${item.author || 'Google News'} • ${date}</span>
-                            <h3 class="text-lg font-bold mt-1 leading-tight">${item.title}</h3>
-                            <p class="text-slate-400 text-sm mt-2 line-clamp-2">${item.description.replace(/<[^>]*>?/gm, '')}</p>
-                        `;
-                        newsContainer.appendChild(card);
-                    });
-                }
-            } catch (error) { console.error("News Error:", error); }
-            finally { if (refreshBtn) refreshBtn.classList.remove('animate-spin'); }
+            
+            const rssUrl = 'https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja';
+            // RSS2JSONのAPIキー（無料枠）を使用するか、プロキシ経由で取得
+            const endpoints = [
+                `https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(rssUrl)}`,
+                `https://api.allorigins.win/get?url=${encodeURIComponent('https://news.google.com/news/rss')}` // 予備
+            ];
+
+            for (const endpoint of endpoints) {
+                try {
+                    const response = await fetch(endpoint);
+                    let data = await response.json();
+                    
+                    let items = data.items;
+                    if (endpoint.includes('allorigins')) {
+                        // AllOriginsの場合はパースが必要（簡易版）
+                        continue; // 今回はRSS2JSONを優先
+                    }
+
+                    if (items && items.length > 0) {
+                        newsContainer.innerHTML = '';
+                        items.slice(0, 10).forEach(item => {
+                            const card = document.createElement('a');
+                            card.href = item.link; card.target = "_blank";
+                            card.className = "block news-card p-5 border border-transparent hover:border-white/10";
+                            const date = new Date(item.pubDate).toLocaleTimeString('ja-JP', {hour: '2-digit', minute:'2-digit'});
+                            card.innerHTML = `
+                                <span class="text-xs font-bold uppercase tracking-wider text-blue-400">${item.author || 'Google News'} • ${date}</span>
+                                <h3 class="text-lg font-bold mt-1 leading-tight">${item.title}</h3>
+                                <p class="text-slate-400 text-sm mt-2 line-clamp-2">${item.description.replace(/<[^>]*>?/gm, '')}</p>
+                            `;
+                            newsContainer.appendChild(card);
+                        });
+                        if (refreshBtn) refreshBtn.classList.remove('animate-spin');
+                        return;
+                    }
+                } catch (e) { console.warn("News fetch error"); }
+            }
+            if (refreshBtn) refreshBtn.classList.remove('animate-spin');
+            newsContainer.innerHTML = `<div class="text-center p-10 text-slate-500 italic">ニュースを読み込めませんでした。時間を置いて再試行してください。</div>`;
         };
 
         window.fetchWeather = async () => {
             try {
-                const response = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=35.98&longitude=140.15&current_weather=true&daily=weathercode,temperature_2m_max,temperature_2m_min&timezone=Asia%2FTokyo`);
+                // Open-MeteoはCORS制限がないので直接叩ける
+                const response = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=35.6895&longitude=139.6917&current_weather=true&daily=weathercode,temperature_2m_max,temperature_2m_min&timezone=Asia%2FTokyo`);
                 const data = await response.json();
                 const current = data.current_weather;
                 const weatherMap = { 0: '☀️', 1: '🌤️', 2: '⛅', 3: '☁️', 45: '🌫️', 51: '🌧️', 61: '🌧️', 71: '❄️', 95: '⛈️' };
                 document.getElementById('weather-temp').textContent = `${Math.round(current.temperature)}°C`;
                 document.getElementById('weather-icon').textContent = weatherMap[current.weathercode] || '🌡️';
+                
                 const dailyContainer = document.getElementById('weekly-forecast');
                 dailyContainer.innerHTML = '';
                 const days = ['日', '月', '火', '水', '木', '金', '土'];
@@ -277,7 +283,7 @@
                 <div class="glass-card p-6 flex-1 flex flex-col min-h-0 overflow-hidden">
                     <span class="text-sm font-semibold text-slate-400 uppercase tracking-wider block mb-4">日本の人気曲 TOP10</span>
                     <div id="music-chart-list" class="flex-1 overflow-y-auto space-y-1 scroll-hide">
-                        <div class="text-xs text-slate-500 p-4">読み込み中...</div>
+                        <div class="text-xs text-slate-500 p-4 italic text-center">読み込み中...</div>
                     </div>
                 </div>
             </div>
@@ -318,16 +324,19 @@
             const now = new Date();
             document.getElementById('clock').textContent = now.toTimeString().split(' ')[0];
             const options = { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' };
-            document.getElementById('current-date').textContent = now.toLocaleDateString('ja-JP', options);
+            const dateStr = now.toLocaleDateString('ja-JP', options);
+            document.getElementById('current-date').textContent = dateStr;
         }
         setInterval(updateClock, 1000);
         updateClock();
+
         function changeFont(v) { document.body.style.fontFamily = v; }
         function performSearch() {
             const q = document.getElementById('search-input').value;
             if (q) window.open(`https://www.google.com/search?q=${encodeURIComponent(q)}`, '_blank');
         }
         document.getElementById('search-input').addEventListener('keypress', (e) => { if (e.key === 'Enter') performSearch(); });
+        
         const themes = {
             dark: 'linear-gradient(135deg, #1e293b 0%, #0f172a 100%)',
             purple: 'linear-gradient(135deg, #6366f1 0%, #312e81 100%)',
